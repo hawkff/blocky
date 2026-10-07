@@ -44,6 +44,18 @@ To print runtime configuration / statistics, you can send `SIGUSR1` signal to ru
 If http listener is enabled, [pprof](https://golang.org/pkg/net/http/pprof/) endpoint (`/debug/pprof`) is enabled
 automatically.
 
+## Memory on small systems
+
+Blocky stores wildcard lists in compact, sorted buckets. Each denylist or allowlist
+cache rebuilds one group at a time and keeps the old group active until its replacement
+is ready. Source downloads within a group still use `blocking.loading.concurrency`, and
+overlapping refresh requests for the same cache run one after another.
+
+A refresh needs memory for the active caches plus the largest group's replacement cache
+and parse buffers. On a memory-constrained host, Go's `GOGC` and `GOMEMLIMIT` settings
+trade CPU for a lower refresh peak; `GOMEMLIMIT` bounds the Go heap, not process RSS.
+See the [Go garbage collector guide](https://go.dev/doc/gc-guide).
+
 ## List sources
 
 Some links/ideas for lists:
