@@ -44,6 +44,28 @@ To print runtime configuration / statistics, you can send `SIGUSR1` signal to ru
 If http listener is enabled, [pprof](https://golang.org/pkg/net/http/pprof/) endpoint (`/debug/pprof`) is enabled
 automatically.
 
+## Memory on small systems
+
+Blocky stores wildcard lists in compact, sorted buckets. Each denylist or allowlist
+cache rebuilds one group at a time and keeps the old group active until its replacement
+is ready. Source downloads within that group still use `blocking.loading.concurrency`.
+Concurrent refresh requests for the same list cache wait their turn.
+
+Allow memory for the active caches, the largest replacement group and its parse buffers.
+A refresh still needs more memory than an idle process. See the
+[ARM64 memory comparison](wildcard-memory.md) for heap, RSS and refresh-peak measurements.
+
+Go's `GOMEMLIMIT` environment variable sets a soft limit on runtime-managed memory,
+not on process RSS. Leave room for the executable, other processes and the operating
+system. A limit below the live caches and working buffers can cause frequent garbage
+collections without preventing an out-of-memory kill. Measure a complete refresh after
+changing the limit. A limit above normal usage will do little.
+
+`GOGC=50` collects more often than the default `GOGC=100`. It reduced the measured
+refresh peak, at the cost of a longer refresh. Compare query latency and refresh time
+before keeping a lower value. Avoid `GOGC=off` on memory-constrained systems.
+See the [Go garbage collector guide](https://go.dev/doc/gc-guide) for both settings.
+
 ## List sources
 
 Some links/ideas for lists:

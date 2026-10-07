@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/0xERR0R/blocky/log"
-	"github.com/0xERR0R/blocky/trie"
 )
 
 type stringCache interface {
@@ -186,84 +185,4 @@ func newRegexCacheFactory() cacheFactory {
 	return &regexCacheFactory{
 		cache: make(regexCache, 0),
 	}
-}
-
-type wildcardCache struct {
-	trie trie.Trie
-	cnt  int
-}
-
-func (cache wildcardCache) elementCount() int {
-	return cache.cnt
-}
-
-func (cache wildcardCache) findMatch(domain string) (string, bool) {
-	labels, ok := cache.trie.HasParentOf(domain)
-	if !ok {
-		return "", false
-	}
-
-	// labels reconstruct the stored wildcard base (normalized, with the "*."
-	// prefix stripped on insertion); re-prepend "*." so the reported rule
-	// matches the entry as configured by the user. trie.JoinTLD pairs with the
-	// trie.SplitTLD this cache is built with, so the separator stays the trie's
-	// concern rather than being hard-coded here.
-	rule := "*." + trie.JoinTLD(labels)
-
-	log.PrefixedLog("wildcard_cache").Debugf("wildcard block rule '%s' matched with '%s'", rule, domain)
-
-	return rule, true
-}
-
-type wildcardCacheFactory struct {
-	trie *trie.Trie
-	cnt  int
-}
-
-func newWildcardCacheFactory() cacheFactory {
-	return &wildcardCacheFactory{
-		trie: trie.NewTrie(trie.SplitTLD),
-	}
-}
-
-func (r *wildcardCacheFactory) addEntry(entry string) bool {
-	globCount := strings.Count(entry, "*")
-	if globCount == 0 {
-		return false
-	}
-
-	if !strings.HasPrefix(entry, "*.") || globCount > 1 {
-		log.Log().Warnf("unsupported wildcard '%s': must start with '*.' and contain no other '*'", entry)
-
-		return true // invalid but handled
-	}
-
-	entry = normalizeWildcard(entry)
-
-	r.trie.Insert(entry)
-
-	r.cnt++
-
-	return true
-}
-
-func (r *wildcardCacheFactory) count() int {
-	return r.cnt
-}
-
-func (r *wildcardCacheFactory) create() stringCache {
-	if r.cnt == 0 {
-		return nil
-	}
-
-	return wildcardCache{*r.trie, r.cnt}
-}
-
-func normalizeWildcard(domain string) string {
-	domain = normalizeEntry(domain)
-	domain = strings.TrimLeft(domain, "*")
-	domain = strings.Trim(domain, ".")
-	domain = strings.ToLower(domain)
-
-	return domain
 }
