@@ -56,13 +56,14 @@ func (cache stringMap) findMatch(searchString string) (string, bool) {
 		return "", false
 	}
 
-	searchBucketLen := len(cache[searchLen]) / searchLen
+	bucket := cache[searchLen]
+	searchBucketLen := len(bucket) / searchLen
 	idx := sort.Search(searchBucketLen, func(i int) bool {
-		return cache[searchLen][i*searchLen:i*searchLen+searchLen] >= normalized
+		return bucket[i*searchLen:i*searchLen+searchLen] >= normalized
 	})
 
 	if idx < searchBucketLen {
-		blockRule := cache[searchLen][idx*searchLen : idx*searchLen+searchLen]
+		blockRule := bucket[idx*searchLen : idx*searchLen+searchLen]
 		if blockRule == normalized {
 			logMatch("string_map", "block rule", blockRule, searchString)
 

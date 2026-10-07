@@ -42,9 +42,8 @@ func BenchmarkLargeList(b *testing.B) {
 				if kind == "exact" && queryKind == "subdomain" {
 					continue
 				}
-				queries := wildcardBenchmarkQueries(b, cache, sample, queryKind)
-
 				b.Run(queryKind, func(b *testing.B) {
+					queries := wildcardBenchmarkQueries(b, cache, sample, queryKind)
 					b.ReportAllocs()
 					i := 0
 					for b.Loop() {
@@ -88,7 +87,7 @@ func wildcardBenchmarkQueries(b *testing.B, cache stringCache, sample []string, 
 		queries = append(queries, query)
 	}
 	if len(queries) == 0 {
-		b.Fatalf("no %s queries", kind)
+		b.Skipf("no %s queries: all candidates match stored rules", kind)
 	}
 
 	return queries

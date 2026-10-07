@@ -17,7 +17,7 @@ var _ = Describe("Compact wildcard cache", func() {
 		entries := []string{
 			"*.Example.COM.", "*.child.example.com", "*.example.com",
 			"*.child.blocked", "*.blocked", "*.xn--bcher-kva.example",
-			"*..single.", "*.",
+			"*.a..b.test", "*..single.", "*.",
 		}
 		for i := range 1000 {
 			entries = append(entries, fmt.Sprintf("*.n%d.branch%d.test", i, i%23))
@@ -31,6 +31,21 @@ var _ = Describe("Compact wildcard cache", func() {
 			entries[i], entries[j] = entries[j], entries[i]
 		}
 		compareWildcardWithTrie(entries)
+	})
+
+	It("matches repeated-dot queries against canonical rules", func() {
+		factory := newWildcardCacheFactory()
+		Expect(factory.addEntry("*.a.b.test")).To(BeTrue())
+		cache := factory.create()
+
+		for _, query := range []string{
+			"x.a..b.test", "a...b..test.", ".a..b.test..",
+			strings.Repeat("x.", 150) + "a..b.test",
+		} {
+			rule, ok := cache.findMatch(query)
+			Expect(ok).To(BeTrue(), query)
+			Expect(rule).To(Equal("*.a.b.test"), query)
+		}
 	})
 
 	It("keeps misses allocation-free, including partial matches and empty labels", func() {
@@ -91,7 +106,8 @@ func compareWildcardWithTrie(entries []string) {
 		legacy.Insert(base)
 		if i%step == 0 {
 			queries = append(queries, base, "sub."+base, "a.b."+base, "not-"+base,
-				base+".invalid", strings.ToUpper(base), base+".", "."+base)
+				base+".invalid", strings.ToUpper(base), base+".", "."+base,
+				strings.ReplaceAll(base, ".", ".."))
 		}
 	}
 
