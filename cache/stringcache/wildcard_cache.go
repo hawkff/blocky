@@ -67,10 +67,6 @@ func (b wildcardBucket) findBase(domain string, seed maphash.Seed) (string, bool
 			continue
 		}
 
-		if domain[i] == '.' {
-			return b.findBaseSkippingEmptyLabels(domain, seed)
-		}
-
 		key := domain[i:]
 		a, z := b.filterBits(seed, key)
 		if b.filter[a/wildcardFilterWordBits]&(uint64(1)<<(a%wildcardFilterWordBits)) == 0 ||
@@ -90,21 +86,6 @@ func (b wildcardBucket) findBase(domain string, seed maphash.Seed) (string, bool
 	}
 
 	return "", false
-}
-
-// The trie matched across empty labels because SplitTLD trims dots on every
-// step. The parser rejects such entries, but direct cache callers can still
-// query them. The stack buffer keeps DNS-length names off the heap.
-func (b wildcardBucket) findBaseSkippingEmptyLabels(domain string, seed maphash.Seed) (string, bool) {
-	var buf [256]byte
-	clean := buf[:0]
-	for i := range len(domain) {
-		if domain[i] != '.' || i == 0 || domain[i-1] != '.' {
-			clean = append(clean, domain[i])
-		}
-	}
-
-	return b.findBase(string(clean), seed)
 }
 
 // The filter only rejects definite misses; binary search verifies every hit.
@@ -140,10 +121,6 @@ func (r *wildcardCacheFactory) addEntry(entry string) bool {
 	entry = normalizeWildcard(entry)
 	if entry == "" {
 		return true
-	}
-
-	if strings.Contains(entry, "..") {
-		entry = strings.Join(strings.FieldsFunc(entry, func(c rune) bool { return c == '.' }), ".")
 	}
 
 	tld, rest := trie.SplitTLD(entry)
