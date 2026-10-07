@@ -52,7 +52,7 @@ func (cache wildcardCache) findMatch(domain string) (string, bool) {
 		rule = "*." + base + "." + tld
 	}
 
-	log.PrefixedLog("wildcard_cache").Debugf("wildcard block rule '%s' matched with '%s'", rule, domain)
+	logMatch("wildcard_cache", "wildcard block rule", rule, domain)
 
 	return rule, true
 }
@@ -92,8 +92,9 @@ func (b wildcardBucket) findBase(domain string, seed maphash.Seed) (string, bool
 	return "", false
 }
 
-// SplitTLD skips empty labels. The parser rejects them, but direct cache
-// callers can still supply them. Keep the scratch buffer off the heap for DNS names.
+// The trie matched across empty labels because SplitTLD trims dots on every
+// step. The parser rejects such entries, but direct cache callers can still
+// query them. The stack buffer keeps DNS-length names off the heap.
 func (b wildcardBucket) findBaseSkippingEmptyLabels(domain string, seed maphash.Seed) (string, bool) {
 	var buf [256]byte
 	clean := buf[:0]

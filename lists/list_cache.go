@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 
 	"github.com/sirupsen/logrus"
@@ -45,7 +44,6 @@ type Matcher interface {
 
 // ListCache generic cache of strings divided in groups
 type ListCache struct {
-	refreshMu    sync.Mutex
 	groupedCache stringcache.GroupedStringCache
 	regexCache   stringcache.GroupedStringCache
 
@@ -53,6 +51,10 @@ type ListCache struct {
 	listType     ListCacheType
 	groupSources map[string][]config.BytesSource
 	downloader   FileDownloader
+
+	// refreshSem admits one refresh at a time. A caller waiting for its turn
+	// returns as soon as its context ends.
+	refreshSem chan struct{}
 }
 
 // LogConfig implements `config.Configurable`.
@@ -96,6 +98,7 @@ func NewListCache(ctx context.Context,
 		listType:     t,
 		groupSources: groupSources,
 		downloader:   downloader,
+		refreshSem:   make(chan struct{}, 1),
 	}
 
 	if cfg.Strategy == config.InitStrategyFast {
@@ -140,8 +143,12 @@ func (b *ListCache) PublishGroupCounts() {
 }
 
 func (b *ListCache) refresh(ctx context.Context) error {
-	b.refreshMu.Lock()
-	defer b.refreshMu.Unlock()
+	select {
+	case b.refreshSem <- struct{}{}:
+		defer func() { <-b.refreshSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	unlimitedGrp, _ := jobgroup.WithContext(ctx)
 	defer unlimitedGrp.Close()
@@ -249,9 +256,6 @@ func (b *ListCache) createCacheForGroup(
 // normal refresh and is best-effort: groups or sources without local data are skipped
 // and a seed failure never aborts startup.
 func (b *ListCache) seedFromDisk(ctx context.Context) {
-	b.refreshMu.Lock()
-	defer b.refreshMu.Unlock()
-
 	dir := b.cfg.Downloads.CachePath
 	if dir == "" {
 		return

@@ -1,6 +1,4 @@
 .idea/
-._*
-.pi/
 *.iml
 *.test
 /*.pem

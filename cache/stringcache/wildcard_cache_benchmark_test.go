@@ -64,22 +64,31 @@ func BenchmarkLargeList(b *testing.B) {
 
 func wildcardBenchmarkQueries(b *testing.B, cache stringCache, sample []string, kind string) []string {
 	b.Helper()
-	queries := make([]string, len(sample))
-	for i, base := range sample {
+	wantHit := kind == "base" || kind == "subdomain"
+	queries := make([]string, 0, len(sample))
+	for _, base := range sample {
+		var query string
 		switch kind {
 		case "base":
-			queries[i] = base
+			query = base
 		case "subdomain":
-			queries[i] = "sub." + base
+			query = "sub." + base
 		case "miss-tld":
-			queries[i] = base + ".invalid"
+			query = base + ".invalid"
 		case "miss-parent":
-			queries[i] = "not-" + base
+			query = "not-" + base
 		}
-		_, hit := cache.findMatch(queries[i])
-		if hit != (kind == "base" || kind == "subdomain") {
-			b.Fatalf("unexpected match for %s query %q", kind, queries[i])
+		if _, hit := cache.findMatch(query); hit != wantHit {
+			if wantHit {
+				b.Fatalf("no match for %s query %q", kind, query)
+			}
+
+			continue // a broader rule in the list covers this miss candidate
 		}
+		queries = append(queries, query)
+	}
+	if len(queries) == 0 {
+		b.Fatalf("no %s queries", kind)
 	}
 
 	return queries

@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/0xERR0R/blocky/log"
 )
 
@@ -26,6 +28,14 @@ type stringMap map[int]string
 
 func normalizeEntry(entry string) string {
 	return strings.ToLower(entry)
+}
+
+// logMatch runs on every hit, so it skips the logrus entry and argument
+// allocations unless debug logging is on.
+func logMatch(prefix, kind, rule, searchString string) {
+	if log.Log().IsLevelEnabled(logrus.DebugLevel) {
+		log.PrefixedLog(prefix).Debugf("%s '%s' matched with '%s'", kind, rule, searchString)
+	}
 }
 
 func (cache stringMap) elementCount() int {
@@ -54,7 +64,7 @@ func (cache stringMap) findMatch(searchString string) (string, bool) {
 	if idx < searchBucketLen {
 		blockRule := cache[searchLen][idx*searchLen : idx*searchLen+searchLen]
 		if blockRule == normalized {
-			log.PrefixedLog("string_map").Debugf("block rule '%s' matched with '%s'", blockRule, searchString)
+			logMatch("string_map", "block rule", blockRule, searchString)
 
 			return blockRule, true
 		}
@@ -130,7 +140,7 @@ func (cache regexCache) elementCount() int {
 func (cache regexCache) findMatch(searchString string) (string, bool) {
 	for _, regex := range cache {
 		if regex.MatchString(searchString) {
-			log.PrefixedLog("regex_cache").Debugf("regex '%s' matched with '%s'", regex, searchString)
+			logMatch("regex_cache", "regex", regex.String(), searchString)
 
 			// re-wrap in the '/.../' delimiters that addEntry strips on insertion
 			// so the reported rule matches the entry as configured by the user.

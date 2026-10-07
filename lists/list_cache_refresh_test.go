@@ -26,6 +26,7 @@ var _ = Describe("List refresh memory bound", func() {
 				case <-r.Context().Done():
 					return
 				}
+				_, _ = fmt.Fprintln(w, "*.refreshed.test")
 			}
 			_, _ = fmt.Fprintln(w, "*.example.test")
 		}))
@@ -59,5 +60,8 @@ var _ = Describe("List refresh memory bound", func() {
 		for range 2 {
 			Eventually(done).Should(Receive(Succeed()))
 		}
+		Expect(cache.Match("sub.refreshed.test", []string{"one", "two"})).To(Equal(map[string]string{
+			"one": "*.refreshed.test", "two": "*.refreshed.test",
+		}))
 	})
 })
