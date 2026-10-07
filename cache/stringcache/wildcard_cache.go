@@ -72,9 +72,8 @@ func (b wildcardBucket) findBase(domain string, seed maphash.Seed) (string, bool
 		}
 
 		key := domain[i:]
-		a, z := b.filterBits(seed, key)
-		if b.filter[a/wildcardFilterWordBits]&(uint64(1)<<(a%wildcardFilterWordBits)) == 0 ||
-			b.filter[z/wildcardFilterWordBits]&(uint64(1)<<(z%wildcardFilterWordBits)) == 0 {
+		word, mask := b.filterBits(seed, key)
+		if b.filter[word]&mask != mask {
 			continue
 		}
 
@@ -106,12 +105,17 @@ func (b wildcardBucket) findBaseSkippingEmptyLabels(domain string, seed maphash.
 	return b.findBase(string(clean), seed)
 }
 
-// The filter only rejects definite misses; binary search verifies every hit.
-func (b wildcardBucket) filterBits(seed maphash.Seed, key string) (uint64, uint64) {
+// filterBits maps key to one filter word and two bits in it, so a probe reads a
+// single cache line. The filter only rejects definite misses; binary search
+// verifies every hit.
+func (b wildcardBucket) filterBits(seed maphash.Seed, key string) (word, mask uint64) {
 	hash := maphash.String(seed, key)
-	mask := uint64(len(b.filter))*wildcardFilterWordBits - 1
+	first := hash % wildcardFilterWordBits
+	second := (hash / wildcardFilterWordBits) % wildcardFilterWordBits
+	// len(b.filter) is a power of two, so the mask selects a valid word.
+	word = (hash / (wildcardFilterWordBits * wildcardFilterWordBits)) & (uint64(len(b.filter)) - 1)
 
-	return hash & mask, (hash >> (wildcardFilterWordBits / 2)) & mask
+	return word, 1<<first | 1<<second
 }
 
 type wildcardCacheFactory struct {
@@ -188,9 +192,8 @@ func (r *wildcardCacheFactory) create() stringCache {
 			bucket.filter = make([]uint64, 1<<bits.Len(uint(count/wildcardFilterEntriesPerWord)))
 			for width, entries := range bucket.entries {
 				for i := 0; i < len(entries); i += width {
-					a, z := bucket.filterBits(cache.seed, entries[i:i+width])
-					bucket.filter[a/wildcardFilterWordBits] |= uint64(1) << (a % wildcardFilterWordBits)
-					bucket.filter[z/wildcardFilterWordBits] |= uint64(1) << (z % wildcardFilterWordBits)
+					word, mask := bucket.filterBits(cache.seed, entries[i:i+width])
+					bucket.filter[word] |= mask
 				}
 			}
 		}
