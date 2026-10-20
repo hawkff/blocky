@@ -175,7 +175,7 @@ func (v *Validator) validateDomainLevel(
 
 	// Query DS records for the child domain from the parent zone
 	// Note: The DS query name is the child domain, but the response comes from parent's authority
-	ctx, dsResponse, err := v.queryRecords(ctx, domain, dns.TypeDS)
+	dsResponse, err := v.queryRecords(ctx, domain, dns.TypeDS)
 	if err != nil {
 		v.logger.Warnf("Failed to query DS for %s: %v", domain, err)
 
@@ -207,7 +207,8 @@ func (v *Validator) validateDomainLevel(
 	// CRITICAL: Now verify the DNSKEY RRset itself using the validated KSK
 	// Per RFC 4035 §5.2: The DNSKEY RRset MUST be signed by a key in the DNSKEY RRset itself
 	// This allows us to trust ALL keys in the set (including ZSKs with different algorithms)
-	if err := v.verifyDNSKEYRRset(answer, validatedKSKs, domain); err != nil {
+	sig, err := v.verifyDNSKEYRRset(answer, validatedKSKs, domain)
+	if err != nil {
 		v.logger.Warnf("Failed to verify DNSKEY RRset for %s: %v", domain, err)
 
 		return ValidationResultBogus, nil
@@ -215,7 +216,24 @@ func (v *Validator) validateDomainLevel(
 
 	v.logger.Debugf("Successfully validated DNSKEY for %s", domain)
 
-	return ValidationResultSecure, keys
+	return ValidationResultSecure, keysUntilSignatureExpiry(keys, sig)
+}
+
+// keysUntilSignatureExpiry returns copies of keys whose TTLs do not exceed the TTL, the original
+// TTL or the remaining lifetime of sig, the RRSIG that validated their RRset (RFC 4035 §5.3.3).
+func keysUntilSignatureExpiry(keys []*dns.DNSKEY, sig *dns.RRSIG) []*dns.DNSKEY {
+	remaining := max(int64(sig.Expiration)-time.Now().Unix(), 0)
+	ttl := min(sig.Hdr.Ttl, sig.OrigTtl, uint32(remaining)) //nolint:gosec // remaining is below the uint32 expiration
+
+	capped := make([]*dns.DNSKEY, 0, len(keys))
+
+	for _, key := range keys {
+		keyCopy := *key
+		keyCopy.Hdr.Ttl = min(keyCopy.Hdr.Ttl, ttl)
+		capped = append(capped, &keyCopy)
+	}
+
+	return capped
 }
 
 // dnskeyFailure maps a queryDNSKEY error to a result: keys that could not be retrieved leave the
@@ -325,10 +343,12 @@ outer:
 	return validKSKs, nil
 }
 
-// verifyDNSKEYRRset verifies the DNSKEY RRset using validated KSKs
+// verifyDNSKEYRRset verifies the DNSKEY RRset using validated KSKs and returns the RRSIG that verified it
 // Per RFC 4035 §5.2: The DNSKEY RRset MUST be self-signed by a key in the set
 // This validates all keys in the RRset, including ZSKs with different algorithms
-func (v *Validator) verifyDNSKEYRRset(answer []dns.RR, validatedKSKs []*dns.DNSKEY, domain string) error {
+func (v *Validator) verifyDNSKEYRRset(
+	answer []dns.RR, validatedKSKs []*dns.DNSKEY, domain string,
+) (*dns.RRSIG, error) {
 	// Extract DNSKEY records and RRSIGs from the answer section
 	var dnskeyRecords []dns.RR
 	var rrsigs []*dns.RRSIG
@@ -345,29 +365,29 @@ func (v *Validator) verifyDNSKEYRRset(answer []dns.RR, validatedKSKs []*dns.DNSK
 	}
 
 	if len(validatedKSKs) == 0 {
-		return errors.New("no validated KSKs provided")
+		return nil, errors.New("no validated KSKs provided")
 	}
 
 	if len(dnskeyRecords) == 0 {
-		return errors.New("no DNSKEY records found in answer")
+		return nil, errors.New("no DNSKEY records found in answer")
 	}
 
 	if len(rrsigs) == 0 {
-		return errors.New("no RRSIG records found for DNSKEY RRset")
+		return nil, errors.New("no RRSIG records found for DNSKEY RRset")
 	}
 
-	err := v.verifyRRSIGMatch(validatedKSKs, dnskeyRecords, rrsigs, domain)
+	sig, err := v.verifyRRSIGMatch(validatedKSKs, dnskeyRecords, rrsigs, domain)
 	if err != nil {
-		return fmt.Errorf("DNSKEY RRset signature verification failed: %w", err)
+		return nil, fmt.Errorf("DNSKEY RRset signature verification failed: %w", err)
 	}
 
-	return nil
+	return sig, nil
 }
 
-// verifyRRSIGMatch verifies that a match between RRSIG and validated KSKs exists
+// verifyRRSIGMatch returns an RRSIG made by one of the validated KSKs that verifies the RRset
 func (v *Validator) verifyRRSIGMatch(
 	validatedKSKs []*dns.DNSKEY, dnskeyRecords []dns.RR, rrsigs []*dns.RRSIG, domain string,
-) error {
+) (*dns.RRSIG, error) {
 	const maxRRSIGVerificationAttempts = 8 // Caps signature verification attempts (KeyTrap, CVE-2023-50387)
 
 	// Per RFC 4035 §2.2: For DNSKEY RRsets, the signer must equal the owner
@@ -393,7 +413,7 @@ func (v *Validator) verifyRRSIGMatch(
 				v.logger.Debugf("Successfully verified DNSKEY RRset for %s with KSK keytag=%d",
 					domain, kskTag)
 
-				return nil
+				return sig, nil
 			}
 
 			sigErrors = append(sigErrors, fmt.Errorf("keytag=%d: %w", kskTag, err))
@@ -405,7 +425,8 @@ func (v *Validator) verifyRRSIGMatch(
 			}
 			verifyAttempts++
 			if verifyAttempts >= maxRRSIGVerificationAttempts {
-				return fmt.Errorf("giving up after %d verification attempts: %w", verifyAttempts, errors.Join(sigErrors...))
+				return nil, fmt.Errorf("giving up after %d verification attempts: %w",
+					verifyAttempts, errors.Join(sigErrors...))
 			}
 		}
 	}
@@ -416,10 +437,10 @@ func (v *Validator) verifyRRSIGMatch(
 			kskDetails = append(kskDetails, fmt.Sprintf("(keytag=%d, algorithm=%d)", ksk.KeyTag(), ksk.Algorithm))
 		}
 
-		return fmt.Errorf("no RRSIG found for validated KSKs %s", strings.Join(kskDetails, "; "))
+		return nil, fmt.Errorf("no RRSIG found for validated KSKs %s", strings.Join(kskDetails, "; "))
 	}
 
-	return errors.Join(sigErrors...)
+	return nil, errors.Join(sigErrors...)
 }
 
 // verifyDomainAgainstTrustAnchor validates the DNSKEY RRset of a zone with a configured trust
@@ -470,7 +491,8 @@ func (v *Validator) verifyDomainAgainstTrustAnchor(
 		return ValidationResultBogus, nil
 	}
 
-	if err := v.verifyDNSKEYRRset(answer, anchored, domain); err != nil {
+	sig, err := v.verifyDNSKEYRRset(answer, anchored, domain)
+	if err != nil {
 		// Without the anchor's signature nothing vouches for the other keys of the RRset, and the
 		// zone signs with them (the root's ZSK signs every TLD's DS RRset).
 		if len(anchored) < len(keys) {
@@ -480,11 +502,13 @@ func (v *Validator) verifyDomainAgainstTrustAnchor(
 		}
 
 		v.logger.Debugf("DNSKEY RRset for %s holds only anchored keys and no anchor signature", domain)
+
+		return ValidationResultSecure, keys
 	}
 
 	v.logger.Debugf("Successfully validated DNSKEY for %s against trust anchor", domain)
 
-	return ValidationResultSecure, keys
+	return ValidationResultSecure, keysUntilSignatureExpiry(keys, sig)
 }
 
 // getParentDomain returns the parent domain of the given domain

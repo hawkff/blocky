@@ -32,7 +32,7 @@ var _ = Describe("Chain of trust validation", func() {
 		logger, _ := log.NewMockEntry()
 
 		sut = NewValidator(ctx, trustStore, logger, mockUpstream, 1, 10, 150, 30, 3600)
-		ctx = context.WithValue(ctx, queryBudgetKey{}, 10)
+		ctx = withQueryBudget(ctx, 10)
 	})
 
 	Describe("getCachedValidation", func() {
@@ -349,7 +349,9 @@ var _ = Describe("Chain of trust validation", func() {
 				[]*dns.DS{zsk.ToDS(dns.SHA256), ksk.ToDS(dns.SHA256)}, zone)
 			Expect(keys).Should(HaveLen(2))
 
-			Expect(sut.verifyDNSKEYRRset([]dns.RR{zsk, ksk, sig}, keys, zone)).Should(Succeed())
+			verified, err := sut.verifyDNSKEYRRset([]dns.RR{zsk, ksk, sig}, keys, zone)
+			Expect(err).Should(Succeed())
+			Expect(verified).Should(Equal(sig))
 		})
 
 		It("rejects an RRset whose only RRSIG is from a key without a DS", func() {
@@ -361,7 +363,7 @@ var _ = Describe("Chain of trust validation", func() {
 			keys, _ := sut.findAndValidateKSKs([]*dns.DNSKEY{dsKey, other}, []*dns.DS{dsKey.ToDS(dns.SHA256)}, zone)
 			Expect(keys).Should(HaveLen(1))
 
-			err := sut.verifyDNSKEYRRset([]dns.RR{dsKey, other, sig}, keys, zone)
+			_, err := sut.verifyDNSKEYRRset([]dns.RR{dsKey, other, sig}, keys, zone)
 			Expect(err).Should(MatchError(ContainSubstring("no RRSIG found")))
 		})
 
@@ -409,13 +411,14 @@ var _ = Describe("Chain of trust validation", func() {
 			It("succeeds when the genuine signature is within the cap", func() {
 				keys, answer := buildZone(3, 2)
 
-				Expect(sut.verifyDNSKEYRRset(answer, keys, zone)).Should(Succeed())
+				_, err := sut.verifyDNSKEYRRset(answer, keys, zone)
+				Expect(err).Should(Succeed())
 			})
 
 			It("bounds a zone with many DS-matched keys and no genuine signature", func() {
 				keys, answer := buildZone(100, -1)
 
-				err := sut.verifyDNSKEYRRset(answer, keys, zone)
+				_, err := sut.verifyDNSKEYRRset(answer, keys, zone)
 				Expect(err).Should(MatchError(ContainSubstring("giving up")))
 			})
 		})
@@ -718,6 +721,53 @@ var _ = Describe("Chain of trust validation", func() {
 
 			time.Sleep(1100 * time.Millisecond)
 
+			result, _ = v.walkChainOfTrust(ctx, chain.child)
+			Expect(result).Should(Equal(ValidationResultSecure))
+			Expect(queries).Should(Equal(5), "the child keys are fetched again, the anchor keys are still cached")
+		})
+
+		It("should take the cache lifetime from the signature that verified the keys", func() {
+			chain := newSignedChain()
+			stale := *chain.childKeySig
+			stale.Expiration = uint32(time.Now().Add(-48 * time.Hour).Unix())
+			queries := 0
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				queries++
+
+				if q := req.Req.Question[0]; q.Qtype == dns.TypeDNSKEY && q.Name == chain.child {
+					return &model.Response{Res: &dns.Msg{Answer: []dns.RR{chain.childKey, &stale, chain.childKeySig}}}, nil
+				}
+
+				return chain.resolve(ctx, req)
+			}
+			v := NewValidator(ctx, chain.anchors, sut.logger, mockUpstream, 1, 10, 150, 30, 3600)
+
+			for range 2 {
+				result, _ := v.walkChainOfTrust(ctx, chain.child)
+				Expect(result).Should(Equal(ValidationResultSecure))
+			}
+
+			Expect(queries).Should(Equal(3), "an extra expired RRSIG must not keep the keys out of the cache")
+		})
+
+		It("should expire validated keys with the signature over their DNSKEY RRset", func() {
+			chain := newSignedChain()
+			chain.childKeySig.Expiration = uint32(time.Now().Add(time.Second).Unix())
+			Expect(chain.childKeySig.Sign(chain.childPriv, []dns.RR{chain.childKey})).Should(Succeed())
+			queries := 0
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				queries++
+
+				return chain.resolve(ctx, req)
+			}
+			v := NewValidator(ctx, chain.anchors, sut.logger, mockUpstream, 1, 10, 150, 30, 3600)
+
+			result, _ := v.walkChainOfTrust(ctx, chain.child)
+			Expect(result).Should(Equal(ValidationResultSecure))
+
+			time.Sleep(1100 * time.Millisecond)
+
+			// The signature is now past its expiration but still inside the clock skew tolerance.
 			result, _ = v.walkChainOfTrust(ctx, chain.child)
 			Expect(result).Should(Equal(ValidationResultSecure))
 			Expect(queries).Should(Equal(5), "the child keys are fetched again, the anchor keys are still cached")
@@ -1173,7 +1223,7 @@ var _ = Describe("Chain of trust validation", func() {
 
 			// Clear any cached validation results
 			sut = NewValidator(ctx, trustStore, sut.logger, mockUpstream, 1, 10, 150, 30, 3600)
-			ctx = context.WithValue(ctx, queryBudgetKey{}, 10)
+			ctx = withQueryBudget(ctx, 10)
 
 			result, _ := sut.walkChainOfTrust(ctx, "sub.example.com.")
 			// Should propagate parent validation failure

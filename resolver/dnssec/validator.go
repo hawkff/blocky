@@ -232,8 +232,9 @@ func (v *Validator) ValidateResponse(
 	start := time.Now()
 	v.logger.Debugf("DNSSEC validation requested for %s", question.Name)
 
-	// Initialize query budget for this validation request (DoS protection)
-	ctx = context.WithValue(ctx, queryBudgetKey{}, int(v.maxUpstreamQueries))
+	// Initialize query budget for this validation request (DoS protection); every sub-query of
+	// the validation draws from it
+	ctx = withQueryBudget(ctx, int(v.maxUpstreamQueries))
 
 	var result ValidationResult
 
@@ -743,7 +744,7 @@ func (v *Validator) checkZoneSecurityStatus(ctx context.Context, domain string) 
 	}
 
 	// Query DS records for this domain from the parent zone
-	ctx, dsResponse, err := v.queryRecords(ctx, domain, dns.TypeDS)
+	dsResponse, err := v.queryRecords(ctx, domain, dns.TypeDS)
 	if err != nil {
 		// Could not reach the upstream (e.g. answering from cache after the upstream is
 		// gone). Fail closed if the name lives under a trust anchor; we must not serve an

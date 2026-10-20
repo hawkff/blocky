@@ -69,6 +69,9 @@ func newSignedZoneKey(zone string) (*dns.DNSKEY, *ecdsa.PrivateKey, string) {
 	key.Algorithm = dns.ECDSAP256SHA256
 
 	priv, err := key.Generate(256)
+	for err == nil && key.KeyTag() == 0 { // RRSIG.Sign rejects key tag 0
+		priv, err = key.Generate(256)
+	}
 	Expect(err).Should(Succeed())
 
 	return key, priv.(*ecdsa.PrivateKey), key.String()
@@ -287,7 +290,7 @@ var _ = Describe("DNSSECValidator", func() {
 			// unsigned children. The authenticated opt-out proof must classify the child as
 			// Insecure (genuinely unsigned) - NOT Secure/Bogus - so the unsigned answer
 			// resolves rather than returning SERVFAIL.
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 			anchor, fn := authenticatedOptOutDelegation("net.", "unsigned.net.")
 			store, err := NewTrustAnchorStore([]string{anchor})
 			Expect(err).Should(Succeed())
@@ -326,7 +329,7 @@ var _ = Describe("DNSSECValidator", func() {
 			// the upstream supplies an AUTHENTICATED NSEC3 opt-out DS denial (the standard way
 			// signed parents delegate to unsigned children), the name is a genuine insecure
 			// delegation and its unsigned answer must pass through as Insecure, not be rejected.
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 			anchor, fn := authenticatedOptOutDelegation("net.", "unsigned.net.")
 			store, err := NewTrustAnchorStore([]string{anchor})
 			Expect(err).Should(Succeed())
@@ -339,7 +342,7 @@ var _ = Describe("DNSSECValidator", func() {
 		})
 
 		It("should not treat an unsigned NSEC in a DS response as authenticated denial of DS", func() {
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 
 			mockUpstream.ResolveFn = func(_ context.Context, req *model.Request) (*model.Response, error) {
 				if req.Req.Question[0].Qtype == dns.TypeDS {
@@ -358,7 +361,7 @@ var _ = Describe("DNSSECValidator", func() {
 		})
 
 		It("should not let a cached insecure status shadow a later signed DS for the same name", func() {
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 
 			// First lookup is answered with the unauthenticated insecure proof.
 			mockUpstream.ResolveFn = func(_ context.Context, req *model.Request) (*model.Response, error) {
@@ -398,7 +401,7 @@ var _ = Describe("DNSSECValidator", func() {
 		})
 
 		It("does not cache a transient chain-validation failure, so recovery is not shadowed (issue #2120)", func() {
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 
 			// The upstream is momentarily unreachable: every DS/DNSKEY sub-query fails.
 			mockUpstream.ResolveFn = func(_ context.Context, _ *model.Request) (*model.Response, error) {
@@ -577,7 +580,7 @@ var _ = Describe("DNSSECValidator", func() {
 
 		It("should preserve the originating client context on DNSKEY sub-queries", func() {
 			clientIP := net.ParseIP("203.0.113.9")
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 			budgetCtx = WithClientContext(budgetCtx, clientIP, []string{"client.lan"}, "client-1", "default")
 
 			var captured *model.Request
@@ -610,7 +613,7 @@ var _ = Describe("DNSSECValidator", func() {
 			// raw DS/DNSKEY, and that SERVFAIL is indistinguishable from an unreachable upstream -
 			// so it would be served as Indeterminate instead of rejected as Bogus. The CD bit
 			// makes the upstream return the raw records for us to judge.
-			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
+			budgetCtx := withQueryBudget(ctx, 30)
 
 			var capturedDNSKEY, capturedDS *model.Request
 			mockUpstream.ResolveFn = func(_ context.Context, req *model.Request) (*model.Response, error) {
@@ -625,7 +628,7 @@ var _ = Describe("DNSSECValidator", func() {
 			}
 
 			_, _, _ = sut.queryDNSKEY(budgetCtx, "signed.example.")
-			_, _, _ = sut.queryRecords(budgetCtx, "signed.example.", dns.TypeDS)
+			_, _ = sut.queryRecords(budgetCtx, "signed.example.", dns.TypeDS)
 
 			Expect(capturedDNSKEY).ShouldNot(BeNil(), "no DNSKEY sub-query was issued")
 			Expect(capturedDNSKEY.Req.CheckingDisabled).Should(BeTrue(),
@@ -712,6 +715,26 @@ var _ = Describe("DNSSECValidator", func() {
 				Expect(v.ValidateResponse(clientCtx, response, question)).Should(Equal(ValidationResultSecure))
 				Expect(queries).Should(Equal(client.queries), "client %d", i)
 			}
+		})
+
+		It("caps the upstream queries of one validation at maxUpstreamQueries", func() {
+			chain := newSignedChain()
+			queries := 0
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				queries++
+
+				return chain.resolve(ctx, req)
+			}
+			response := signedA("www."+chain.child, "192.0.2.1", chain.childKey, chain.childPriv, chain.child)
+			question := dns.Question{Name: "www." + chain.child, Qtype: dns.TypeA, Qclass: dns.ClassINET}
+
+			// The walk needs three queries: DNSKEY of the anchor, then DS and DNSKEY of the child.
+			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 2, 3600)
+			Expect(v.ValidateResponse(ctx, response, question)).Should(Equal(ValidationResultIndeterminate))
+			Expect(queries).Should(Equal(2))
+
+			v = NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 3, 3600)
+			Expect(v.ValidateResponse(ctx, response, question)).Should(Equal(ValidationResultSecure))
 		})
 
 		It("does not trust a key the anchored DNSKEY RRset carries without the anchor's signature", func() {
@@ -3828,7 +3851,7 @@ var _ = Describe("Additional Validator Coverage", func() {
 		logger, _ := log.NewMockEntry()
 
 		sut = NewValidator(ctx, trustStore, logger, mockUpstream, 1, 10, 150, 30, 3600)
-		ctx = context.WithValue(ctx, queryBudgetKey{}, 10)
+		ctx = withQueryBudget(ctx, 10)
 	})
 
 	Describe("validateSingleRRset DNSKEY validation", func() {
