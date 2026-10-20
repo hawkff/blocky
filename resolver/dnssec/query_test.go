@@ -233,14 +233,34 @@ var _ = Describe("Query functions", func() {
 				}, nil
 			}
 
-			newCtx, keys, err := sut.queryDNSKEY(ctx, "example.com")
+			answer, keys, err := sut.queryDNSKEY(ctx, "example.com")
 			Expect(err).Should(Succeed())
+			Expect(answer).Should(Equal([]dns.RR{dnskey}))
 			Expect(keys).Should(HaveLen(1))
 			Expect(keys[0]).Should(Equal(dnskey))
+		})
 
-			// Verify budget was decremented
-			budget := newCtx.Value(queryBudgetKey{}).(int)
-			Expect(budget).Should(Equal(9))
+		It("should treat SERVFAIL as unavailable keys", func() {
+			ctx := context.WithValue(context.Background(), queryBudgetKey{}, 10)
+
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				return &model.Response{Res: &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeServerFailure}}}, nil
+			}
+
+			_, _, err := sut.queryDNSKEY(ctx, "example.com")
+			Expect(err).Should(MatchError(errDNSKEYUnavailable))
+		})
+
+		It("should not treat NXDOMAIN as unavailable keys", func() {
+			ctx := context.WithValue(context.Background(), queryBudgetKey{}, 10)
+
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				return &model.Response{Res: &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeNameError}}}, nil
+			}
+
+			_, _, err := sut.queryDNSKEY(ctx, "example.com")
+			Expect(err).Should(HaveOccurred())
+			Expect(err).ShouldNot(MatchError(errDNSKEYUnavailable))
 		})
 
 		It("should handle no DNSKEY records in response", func() {
@@ -277,7 +297,7 @@ var _ = Describe("Query functions", func() {
 			}
 
 			_, _, err := sut.queryDNSKEY(ctx, "example.com")
-			Expect(err).Should(HaveOccurred())
+			Expect(err).Should(MatchError(errDNSKEYUnavailable))
 		})
 
 		It("should extract multiple DNSKEY records", func() {

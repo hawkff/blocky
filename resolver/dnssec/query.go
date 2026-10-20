@@ -20,18 +20,22 @@ type queryBudgetKey struct{}
 // as the user-facing answer.
 type clientContextKey struct{}
 
-// clientContext holds the originating client's identity for DNSSEC sub-queries.
+// clientContext holds the originating client's identity for DNSSEC sub-queries and the
+// upstream view that answers them.
 type clientContext struct {
 	ip       net.IP
 	names    []string
 	clientID string
+	view     string
 }
 
 // WithClientContext returns a context carrying the originating client's identity so
-// DNSSEC auxiliary queries issued during validation preserve it. Called by the DNSSEC
+// DNSSEC auxiliary queries issued during validation preserve it. view names the upstream
+// group those queries reach; validation results are cached per view. Called by the DNSSEC
 // resolver before validating a response.
-func WithClientContext(ctx context.Context, ip net.IP, names []string, clientID string) context.Context {
-	return context.WithValue(ctx, clientContextKey{}, clientContext{ip: ip, names: names, clientID: clientID})
+func WithClientContext(ctx context.Context, ip net.IP, names []string, clientID, view string) context.Context {
+	return context.WithValue(ctx, clientContextKey{},
+		clientContext{ip: ip, names: names, clientID: clientID, view: view})
 }
 
 // clientContextFrom extracts the originating client's identity from the context.
@@ -116,20 +120,29 @@ func (v *Validator) queryRecords(
 	return newCtx, response.Res, nil
 }
 
-// queryDNSKEY queries upstream for DNSKEY records
-// Returns (newContext, dnskeys, error) where newContext has decremented budget
-func (v *Validator) queryDNSKEY(ctx context.Context, domain string) (context.Context, []*dns.DNSKEY, error) {
-	ctx, response, err := v.queryRecords(ctx, domain, dns.TypeDNSKEY)
+// queryDNSKEY queries upstream for the DNSKEY RRset of a zone
+// Returns the answer section (the keys and their RRSIGs) and the keys in it
+func (v *Validator) queryDNSKEY(ctx context.Context, domain string) ([]dns.RR, []*dns.DNSKEY, error) {
+	_, response, err := v.queryRecords(ctx, domain, dns.TypeDNSKEY)
 	if err != nil {
 		// The sub-query itself failed (timeout/unreachable upstream/budget). This is a
 		// transient inability to gather validation data, NOT proof of an invalid signature,
 		// so tag it errDNSKEYUnavailable: callers propagate it as Indeterminate rather than
 		// Bogus (issue #2120). A response that arrives but contains no DNSKEY records falls
 		// through to the genuine "no records" failure below and stays Bogus.
-		return ctx, nil, fmt.Errorf("%w: %w", errDNSKEYUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %w", errDNSKEYUnavailable, err)
+	}
+
+	// SERVFAIL (the upstream could not reach the zone) is the same transient failure; any other
+	// answer without keys, NXDOMAIN included, is not.
+	if response.Rcode == dns.RcodeServerFailure {
+		return nil, nil, fmt.Errorf("%w: SERVFAIL", errDNSKEYUnavailable)
 	}
 
 	keys, err := extractTypedRecords[*dns.DNSKEY](response.Answer)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	return ctx, keys, err
+	return response.Answer, keys, nil
 }

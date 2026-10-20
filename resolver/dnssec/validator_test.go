@@ -192,6 +192,66 @@ func benignEmptyResolve(_ context.Context, _ *model.Request) (*model.Response, e
 	return &model.Response{Res: &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeSuccess}}}, nil
 }
 
+// signedChain is a signed zone delegated from a trust-anchored parent zone.
+type signedChain struct {
+	anchors      *TrustAnchorStore
+	parent       string
+	parentKey    *dns.DNSKEY
+	parentPriv   *ecdsa.PrivateKey
+	parentKeySig *dns.RRSIG
+	child        string
+	childKey     *dns.DNSKEY
+	childPriv    *ecdsa.PrivateKey
+	childKeySig  *dns.RRSIG
+	ds           *dns.DS
+	dsSig        *dns.RRSIG
+}
+
+// newSignedChain returns the chain example. -> signed.example. with example. as trust anchor.
+func newSignedChain() *signedChain {
+	c := &signedChain{parent: "example.", child: "signed.example."}
+
+	var anchor string
+	c.parentKey, c.parentPriv, anchor = newSignedZoneKey(c.parent)
+	c.parentKeySig = signRRset([]dns.RR{c.parentKey}, dns.TypeDNSKEY, c.parentKey, c.parentPriv, c.parent)
+	c.childKey, c.childPriv, _ = newSignedZoneKey(c.child)
+	c.childKeySig = signRRset([]dns.RR{c.childKey}, dns.TypeDNSKEY, c.childKey, c.childPriv, c.child)
+	c.ds = c.childKey.ToDS(dns.SHA256)
+	c.dsSig = signRRset([]dns.RR{c.ds}, dns.TypeDS, c.parentKey, c.parentPriv, c.parent)
+
+	var err error
+	c.anchors, err = NewTrustAnchorStore([]string{anchor})
+	Expect(err).Should(Succeed())
+
+	return c
+}
+
+// resolve answers the DS and DNSKEY sub-queries of the chain.
+func (c *signedChain) resolve(_ context.Context, req *model.Request) (*model.Response, error) {
+	q := req.Req.Question[0]
+
+	switch {
+	case q.Qtype == dns.TypeDNSKEY && q.Name == c.parent:
+		return &model.Response{Res: &dns.Msg{Answer: []dns.RR{c.parentKey, c.parentKeySig}}}, nil
+	case q.Qtype == dns.TypeDS && q.Name == c.child:
+		return &model.Response{Res: &dns.Msg{Answer: []dns.RR{c.ds, c.dsSig}}}, nil
+	case q.Qtype == dns.TypeDNSKEY && q.Name == c.child:
+		return &model.Response{Res: &dns.Msg{Answer: []dns.RR{c.childKey, c.childKeySig}}}, nil
+	}
+
+	return &model.Response{Res: &dns.Msg{}}, nil
+}
+
+// signedA returns a response with an A record for name signed with key/priv as signer.
+func signedA(name, ip string, key *dns.DNSKEY, priv *ecdsa.PrivateKey, signer string) *dns.Msg {
+	a := &dns.A{
+		Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP(ip),
+	}
+
+	return &dns.Msg{Answer: []dns.RR{a, signRRset([]dns.RR{a}, dns.TypeA, key, priv, signer)}}
+}
+
 var _ = Describe("DNSSECValidator", func() {
 	var (
 		sut          *Validator
@@ -346,7 +406,7 @@ var _ = Describe("DNSSECValidator", func() {
 			}
 
 			const zone = "office.com."
-			first := sut.walkChainOfTrust(budgetCtx, zone)
+			first, _ := sut.walkChainOfTrust(budgetCtx, zone)
 			Expect(first).Should(Equal(ValidationResultIndeterminate),
 				"a transient upstream failure should yield Indeterminate, not a durable verdict")
 
@@ -518,7 +578,7 @@ var _ = Describe("DNSSECValidator", func() {
 		It("should preserve the originating client context on DNSKEY sub-queries", func() {
 			clientIP := net.ParseIP("203.0.113.9")
 			budgetCtx := context.WithValue(ctx, queryBudgetKey{}, 30)
-			budgetCtx = WithClientContext(budgetCtx, clientIP, []string{"client.lan"}, "client-1")
+			budgetCtx = WithClientContext(budgetCtx, clientIP, []string{"client.lan"}, "client-1", "default")
 
 			var captured *model.Request
 			mockUpstream.ResolveFn = func(_ context.Context, req *model.Request) (*model.Response, error) {
@@ -613,8 +673,8 @@ var _ = Describe("DNSSECValidator", func() {
 			// GHSA-x845-2f78-7v36 finding 3: the validation cache must not be keyed by bare
 			// domain name. A status established for one client view (upstream group) must not be
 			// reused for a different view, or one response path can seed DNSSEC state for another.
-			viewA := WithClientContext(ctx, net.ParseIP("203.0.113.1"), []string{"a.lan"}, "group-a")
-			viewB := WithClientContext(ctx, net.ParseIP("198.51.100.2"), []string{"b.lan"}, "group-b")
+			viewA := WithClientContext(ctx, net.ParseIP("203.0.113.1"), []string{"a.lan"}, "client-a", "group-a")
+			viewB := WithClientContext(ctx, net.ParseIP("198.51.100.2"), []string{"b.lan"}, "client-b", "group-b")
 
 			sut.setCachedValidation(viewA, victim, ValidationResultInsecure)
 
@@ -625,6 +685,155 @@ var _ = Describe("DNSSECValidator", func() {
 			cached, foundSame := sut.getCachedValidation(viewA, victim)
 			Expect(foundSame).Should(BeTrue(), "validation result was not cached within its own view")
 			Expect(cached).Should(Equal(ValidationResultInsecure))
+		})
+
+		It("shares validated keys between clients of the same upstream view", func() {
+			chain := newSignedChain()
+			queries := 0
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				queries++
+
+				return chain.resolve(ctx, req)
+			}
+			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 30, 3600)
+			response := signedA("www."+chain.child, "192.0.2.1", chain.childKey, chain.childPriv, chain.child)
+			question := dns.Question{Name: "www." + chain.child, Qtype: dns.TypeA, Qclass: dns.ClassINET}
+
+			for i, client := range []struct {
+				ip, view string
+				queries  int
+			}{
+				{"192.0.2.10", "default", 3},
+				{"192.0.2.11", "default", 3},
+				{"192.0.2.12", "other", 6},
+			} {
+				clientCtx := WithClientContext(ctx, net.ParseIP(client.ip), nil, "", client.view)
+
+				Expect(v.ValidateResponse(clientCtx, response, question)).Should(Equal(ValidationResultSecure))
+				Expect(queries).Should(Equal(client.queries), "client %d", i)
+			}
+		})
+
+		It("does not trust a key the anchored DNSKEY RRset carries without the anchor's signature", func() {
+			chain := newSignedChain()
+			forgedKey, forgedPriv, _ := newSignedZoneKey(chain.parent)
+			mockUpstream.ResolveFn = func(_ context.Context, req *model.Request) (*model.Response, error) {
+				return &model.Response{Res: &dns.Msg{Answer: []dns.RR{chain.parentKey, forgedKey}}}, nil
+			}
+			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 30, 3600)
+
+			Expect(v.ValidateResponse(ctx,
+				signedA("www."+chain.parent, "192.0.2.66", forgedKey, forgedPriv, chain.parent),
+				dns.Question{Name: "www." + chain.parent, Qtype: dns.TypeA, Qclass: dns.ClassINET},
+			)).Should(Equal(ValidationResultBogus))
+		})
+
+		It("does not trust a key added to the root DNSKEY RRset under the default trust anchors", func() {
+			store, err := NewTrustAnchorStore(nil)
+			Expect(err).Should(Succeed())
+			rr, err := dns.NewRR(getDefaultRootTrustAnchors()[1])
+			Expect(err).Should(Succeed())
+
+			forgedRoot, forgedRootPriv, _ := newSignedZoneKey(".")
+			forgedCom, forgedComPriv, _ := newSignedZoneKey("com.")
+			forgedComSig := signRRset([]dns.RR{forgedCom}, dns.TypeDNSKEY, forgedCom, forgedComPriv, "com.")
+			forgedDS := forgedCom.ToDS(dns.SHA256)
+			forgedDSSig := signRRset([]dns.RR{forgedDS}, dns.TypeDS, forgedRoot, forgedRootPriv, ".")
+
+			mockUpstream.ResolveFn = func(_ context.Context, req *model.Request) (*model.Response, error) {
+				q := req.Req.Question[0]
+
+				switch {
+				case q.Qtype == dns.TypeDNSKEY && q.Name == ".":
+					return &model.Response{Res: &dns.Msg{Answer: []dns.RR{rr, forgedRoot}}}, nil
+				case q.Qtype == dns.TypeDS && q.Name == "com.":
+					return &model.Response{Res: &dns.Msg{Answer: []dns.RR{forgedDS, forgedDSSig}}}, nil
+				case q.Qtype == dns.TypeDNSKEY && q.Name == "com.":
+					return &model.Response{Res: &dns.Msg{Answer: []dns.RR{forgedCom, forgedComSig}}}, nil
+				}
+
+				return &model.Response{Res: &dns.Msg{}}, nil
+			}
+			v := NewValidator(ctx, store, logger, mockUpstream, 1, 10, 150, 30, 3600)
+
+			Expect(v.ValidateResponse(ctx,
+				signedA("www.example.com.", "192.0.2.66", forgedCom, forgedComPriv, "com."),
+				dns.Question{Name: "www.example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET},
+			)).Should(Equal(ValidationResultBogus))
+		})
+
+		It("does not let an insecure signer above a trust anchor vouch for the anchored zone", func() {
+			// The root delegates example. without a DS RRset; corp.example. has its own trust anchor.
+			rootAnchor, fn := authenticatedInsecureDelegation(".", "example.")
+			_, _, corpAnchor := newSignedZoneKey("corp.example.")
+			store, err := NewTrustAnchorStore([]string{rootAnchor, corpAnchor})
+			Expect(err).Should(Succeed())
+			mockUpstream.ResolveFn = fn
+			v := NewValidator(ctx, store, logger, mockUpstream, 1, 10, 150, 30, 3600)
+			forgedKey, forgedPriv, _ := newSignedZoneKey("example.")
+
+			for name, expected := range map[string]ValidationResult{
+				"www.corp.example.": ValidationResultBogus,
+				"www.example.":      ValidationResultInsecure,
+			} {
+				Expect(v.ValidateResponse(ctx,
+					signedA(name, "192.0.2.66", forgedKey, forgedPriv, "example."),
+					dns.Question{Name: name, Qtype: dns.TypeA, Qclass: dns.ClassINET},
+				)).Should(Equal(expected), name)
+			}
+		})
+
+		It("verifies signatures only with keys from the signer's validated DNSKEY RRset", func() {
+			chain := newSignedChain()
+			mockUpstream.ResolveFn = chain.resolve
+			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 30, 3600)
+			question := dns.Question{Name: "www." + chain.child, Qtype: dns.TypeA, Qclass: dns.ClassINET}
+
+			Expect(v.ValidateResponse(ctx,
+				signedA(question.Name, "192.0.2.1", chain.childKey, chain.childPriv, chain.child), question,
+			)).Should(Equal(ValidationResultSecure))
+
+			// A DNSKEY response with a key outside the validated RRset must not verify anything.
+			forgedKey, forgedPriv, _ := newSignedZoneKey(chain.child)
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				if req.Req.Question[0].Qtype == dns.TypeDNSKEY && req.Req.Question[0].Name == chain.child {
+					return &model.Response{Res: &dns.Msg{Answer: []dns.RR{forgedKey}}}, nil
+				}
+
+				return chain.resolve(ctx, req)
+			}
+
+			Expect(v.ValidateResponse(ctx,
+				signedA(question.Name, "192.0.2.66", forgedKey, forgedPriv, chain.child), question,
+			)).Should(Equal(ValidationResultBogus))
+		})
+
+		It("does not accept a DS denial in the chain of trust that the parent zone did not sign", func() {
+			chain := newSignedChain()
+			denial := &dns.NSEC{
+				Hdr:        dns.RR_Header{Name: chain.child, Rrtype: dns.TypeNSEC, Class: dns.ClassINET, Ttl: 300},
+				NextDomain: "\\000." + chain.child,
+				TypeBitMap: []uint16{dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC}, // NS delegation present, DS absent
+			}
+			forgedKey, forgedPriv, _ := newSignedZoneKey(chain.child)
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				q := req.Req.Question[0]
+
+				switch {
+				case q.Qtype == dns.TypeDS && q.Name == chain.child:
+					return &model.Response{Res: &dns.Msg{Ns: []dns.RR{denial}}}, nil
+				case q.Qtype == dns.TypeDNSKEY && q.Name == chain.child:
+					return &model.Response{Res: &dns.Msg{Answer: []dns.RR{forgedKey}}}, nil
+				}
+
+				return chain.resolve(ctx, req)
+			}
+			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 30, 3600)
+			question := dns.Question{Name: "www." + chain.child, Qtype: dns.TypeA, Qclass: dns.ClassINET}
+
+			Expect(v.ValidateResponse(ctx,
+				signedA(question.Name, "192.0.2.66", forgedKey, forgedPriv, chain.child), question,
+			)).Should(Equal(ValidationResultBogus))
 		})
 	})
 
@@ -1497,7 +1706,7 @@ var _ = Describe("DNSSECValidator", func() {
 			deepDomain := "a.b.c.d.e.f.g.h.i.j.k.example.com." // 13 labels
 
 			// Validator configured with maxChainDepth=10
-			result := sut.walkChainOfTrust(ctx, deepDomain)
+			result, _ := sut.walkChainOfTrust(ctx, deepDomain)
 
 			// Should be rejected as Bogus due to depth limit
 			Expect(result).Should(Equal(ValidationResultBogus))
@@ -1556,7 +1765,7 @@ var _ = Describe("DNSSECValidator", func() {
 			for range 10 {
 				go func() {
 					defer GinkgoRecover()
-					_ = sut.walkChainOfTrust(ctx, domain)
+					_, _ = sut.walkChainOfTrust(ctx, domain)
 					done <- true
 				}()
 			}
@@ -2036,7 +2245,7 @@ var _ = Describe("DNSSECValidator", func() {
 						Expiration:  uint32(time.Now().Add(24 * time.Hour).Unix()),
 						Inception:   uint32(time.Now().Add(-1 * time.Hour).Unix()),
 						KeyTag:      12345,
-						SignerName:  "h.",
+						SignerName:  "a.b.c.d.e.f.g.h.", // the chain of trust is walked for the signer
 						Signature:   "fakesignature",
 					},
 				},
@@ -2286,16 +2495,38 @@ var _ = Describe("DNSSECValidator", func() {
 				NextDomain: "z.example.com.",
 				TypeBitMap: []uint16{dns.TypeA, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC}, // No DS
 			}
+			parentKey, parentPriv, _ := newSignedZoneKey("com.")
 
 			response := &dns.Msg{
 				Answer: []dns.RR{}, // No DS records
-				Ns:     []dns.RR{nsec},
+				Ns:     []dns.RR{nsec, signRRset([]dns.RR{nsec}, dns.TypeNSEC, parentKey, parentPriv, "com.")},
 			}
 
-			dsRecords, result := sut.extractAndValidateDSRecords(ctx, "example.com.", "com.", response)
+			dsRecords, result := sut.extractAndValidateDSRecords("example.com.", []*dns.DNSKEY{parentKey}, response)
 
 			Expect(dsRecords).Should(BeNil())
 			Expect(result).Should(Equal(ValidationResultInsecure))
+		})
+
+		It("should reject an NSEC proof of DS absence that the parent zone did not sign", func() {
+			nsec := &dns.NSEC{
+				Hdr:        dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNSEC, Class: dns.ClassINET, Ttl: 300},
+				NextDomain: "z.example.com.",
+				TypeBitMap: []uint16{dns.TypeA, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC}, // No DS
+			}
+			parentKey, _, _ := newSignedZoneKey("com.")
+			otherKey, otherPriv, _ := newSignedZoneKey("com.")
+
+			for _, ns := range [][]dns.RR{
+				{nsec},
+				{nsec, signRRset([]dns.RR{nsec}, dns.TypeNSEC, otherKey, otherPriv, "com.")},
+			} {
+				dsRecords, result := sut.extractAndValidateDSRecords("example.com.", []*dns.DNSKEY{parentKey},
+					&dns.Msg{Ns: ns})
+
+				Expect(dsRecords).Should(BeNil())
+				Expect(result).Should(Equal(ValidationResultBogus))
+			}
 		})
 
 		It("should accept valid NSEC3 proof of DS absence", func() {
@@ -2314,16 +2545,18 @@ var _ = Describe("DNSSECValidator", func() {
 				Flags:      0,
 				Iterations: 10,
 				Salt:       "",
-				NextDomain: "ZZZZZZZZZZZZZZZZZZZZZZZZ",
+				HashLength: 20,
+				NextDomain: "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV",
 				TypeBitMap: []uint16{dns.TypeA, dns.TypeNS, dns.TypeRRSIG}, // No DS
 			}
+			parentKey, parentPriv, _ := newSignedZoneKey("com.")
 
 			response := &dns.Msg{
 				Answer: []dns.RR{}, // No DS records
-				Ns:     []dns.RR{nsec3},
+				Ns:     []dns.RR{nsec3, signRRset([]dns.RR{nsec3}, dns.TypeNSEC3, parentKey, parentPriv, "com.")},
 			}
 
-			dsRecords, result := sut.extractAndValidateDSRecords(ctx, "example.com.", "com.", response)
+			dsRecords, result := sut.extractAndValidateDSRecords("example.com.", []*dns.DNSKEY{parentKey}, response)
 
 			Expect(dsRecords).Should(BeNil())
 			Expect(result).Should(Equal(ValidationResultInsecure))
@@ -2347,7 +2580,7 @@ var _ = Describe("DNSSECValidator", func() {
 				Ns:     []dns.RR{nsec},
 			}
 
-			dsRecords, result := sut.extractAndValidateDSRecords(ctx, "example.com.", "com.", response)
+			dsRecords, result := sut.extractAndValidateDSRecords("example.com.", nil, response)
 
 			Expect(dsRecords).Should(BeNil())
 			Expect(result).Should(Equal(ValidationResultBogus))
@@ -2371,7 +2604,7 @@ var _ = Describe("DNSSECValidator", func() {
 				Ns:     []dns.RR{nsec},
 			}
 
-			dsRecords, result := sut.extractAndValidateDSRecords(ctx, "example.com.", "com.", response)
+			dsRecords, result := sut.extractAndValidateDSRecords("example.com.", nil, response)
 
 			Expect(dsRecords).Should(BeNil())
 			Expect(result).Should(Equal(ValidationResultBogus))
@@ -2383,7 +2616,7 @@ var _ = Describe("DNSSECValidator", func() {
 				Ns:     []dns.RR{}, // No NSEC/NSEC3 proof
 			}
 
-			dsRecords, result := sut.extractAndValidateDSRecords(ctx, "example.com.", "com.", response)
+			dsRecords, result := sut.extractAndValidateDSRecords("example.com.", nil, response)
 
 			Expect(dsRecords).Should(BeNil())
 			Expect(result).Should(Equal(ValidationResultIndeterminate))
@@ -2413,7 +2646,7 @@ var _ = Describe("DNSSECValidator", func() {
 				Ns:     []dns.RR{nsec3},
 			}
 
-			dsRecords, result := sut.extractAndValidateDSRecords(ctx, "example.com.", "com.", response)
+			dsRecords, result := sut.extractAndValidateDSRecords("example.com.", nil, response)
 
 			Expect(dsRecords).Should(BeNil())
 			Expect(result).Should(Equal(ValidationResultBogus))
@@ -3437,7 +3670,7 @@ var _ = Describe("DNSSECValidator", func() {
 				mockUpstream.On("Resolve", mock.Anything, mock.Anything).Return(&model.Response{Res: dnskeyResp}, nil).Once()
 
 				// Don't add any trust anchor
-				result := sut.verifyDomainAgainstTrustAnchor(ctx, "example.com.")
+				result, _ := sut.verifyDomainAgainstTrustAnchor(ctx, "example.com.")
 				Expect(result).Should(Equal(ValidationResultIndeterminate))
 			})
 		})
@@ -3452,7 +3685,7 @@ var _ = Describe("DNSSECValidator", func() {
 				// Mock the DNSKEY query to fail
 				mockUpstream.On("Resolve", mock.Anything, mock.Anything).Return(nil, errors.New("query failed")).Once()
 
-				result := sut.verifyDomainAgainstTrustAnchor(ctx, "example.com.")
+				result, _ := sut.verifyDomainAgainstTrustAnchor(ctx, "example.com.")
 				Expect(result).Should(Equal(ValidationResultIndeterminate))
 			})
 		})
@@ -3473,7 +3706,7 @@ var _ = Describe("DNSSECValidator", func() {
 				dnskeyResp.Answer = []dns.RR{dnskey}
 				mockUpstream.On("Resolve", mock.Anything, mock.Anything).Return(&model.Response{Res: dnskeyResp}, nil).Once()
 
-				result := sut.verifyDomainAgainstTrustAnchor(ctx, "example.com.")
+				result, _ := sut.verifyDomainAgainstTrustAnchor(ctx, "example.com.")
 				// In unit tests with mocked upstream, result may vary
 				// Just verify the function executes without panic
 				Expect(result).Should(BeElementOf(
