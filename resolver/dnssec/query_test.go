@@ -133,6 +133,20 @@ var _ = Describe("Query functions", func() {
 			Expect(err.Error()).Should(ContainSubstring("budget exhausted"))
 		})
 
+		It("should treat a truncated reply as a failed query", func() {
+			ctx := withQueryBudget(context.Background(), 10)
+
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				return &model.Response{Res: &dns.Msg{MsgHdr: dns.MsgHdr{Truncated: true}}}, nil
+			}
+
+			_, err := sut.queryRecords(ctx, "example.com", dns.TypeDS)
+			Expect(err).Should(MatchError(ContainSubstring("truncated")))
+
+			_, _, err = sut.queryDNSKEY(ctx, "example.com")
+			Expect(err).Should(MatchError(errDNSKEYUnavailable))
+		})
+
 		It("should handle upstream query errors", func() {
 			ctx := withQueryBudget(context.Background(), 10)
 

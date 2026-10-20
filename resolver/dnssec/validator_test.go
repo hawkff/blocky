@@ -717,7 +717,7 @@ var _ = Describe("DNSSECValidator", func() {
 			}
 		})
 
-		It("caps the upstream queries of one validation at maxUpstreamQueries", func() {
+		It("refuses the answer when one validation runs out of upstream queries", func() {
 			chain := newSignedChain()
 			queries := 0
 			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
@@ -725,16 +725,21 @@ var _ = Describe("DNSSECValidator", func() {
 
 				return chain.resolve(ctx, req)
 			}
-			response := signedA("www."+chain.child, "192.0.2.1", chain.childKey, chain.childPriv, chain.child)
 			question := dns.Question{Name: "www." + chain.child, Qtype: dns.TypeA, Qclass: dns.ClassINET}
+			signed := signedA(question.Name, "192.0.2.1", chain.childKey, chain.childPriv, chain.child)
+			tampered := signedA(question.Name, "192.0.2.1", chain.childKey, chain.childPriv, chain.child)
+			tampered.Answer[0] = &dns.A{Hdr: *tampered.Answer[0].Header(), A: net.ParseIP("203.0.113.66")}
 
 			// The walk needs three queries: DNSKEY of the anchor, then DS and DNSKEY of the child.
-			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 2, 3600)
-			Expect(v.ValidateResponse(ctx, response, question)).Should(Equal(ValidationResultIndeterminate))
-			Expect(queries).Should(Equal(2))
+			for _, response := range []*dns.Msg{signed, tampered} {
+				queries = 0
+				v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 2, 3600)
+				Expect(v.ValidateResponse(ctx, response, question)).Should(Equal(ValidationResultBogus))
+				Expect(queries).Should(Equal(2))
+			}
 
-			v = NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 3, 3600)
-			Expect(v.ValidateResponse(ctx, response, question)).Should(Equal(ValidationResultSecure))
+			v := NewValidator(ctx, chain.anchors, logger, mockUpstream, 1, 10, 150, 3, 3600)
+			Expect(v.ValidateResponse(ctx, signed, question)).Should(Equal(ValidationResultSecure))
 		})
 
 		It("does not trust a key the anchored DNSKEY RRset carries without the anchor's signature", func() {

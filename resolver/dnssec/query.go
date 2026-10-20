@@ -71,6 +71,13 @@ func (v *Validator) consumeQueryBudget(ctx context.Context) error {
 	return nil
 }
 
+// queryBudgetExhausted reports whether the budget refused a query of this validation
+func queryBudgetExhausted(ctx context.Context) bool {
+	budget, ok := ctx.Value(queryBudgetKey{}).(*atomic.Int64)
+
+	return ok && budget.Load() < 0
+}
+
 // queryRecords performs a DNS query for a specific record type with DNSSEC enabled
 func (v *Validator) queryRecords(ctx context.Context, domain string, qtype uint16) (*dns.Msg, error) {
 	// Check query budget (DoS protection)
@@ -109,6 +116,12 @@ func (v *Validator) queryRecords(ctx context.Context, domain string, qtype uint1
 	response, err := v.upstream.Resolve(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("upstream query failed: %w", err)
+	}
+
+	// The upstream keeps a truncated UDP reply when its TCP retry fails. Records may be missing
+	// from it, so it counts as a failed query, not as an answer without them.
+	if response.Res.Truncated {
+		return nil, fmt.Errorf("upstream query failed: truncated reply for %s", domain)
 	}
 
 	return response.Res, nil

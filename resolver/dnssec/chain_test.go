@@ -726,6 +726,27 @@ var _ = Describe("Chain of trust validation", func() {
 			Expect(queries).Should(Equal(5), "the child keys are fetched again, the anchor keys are still cached")
 		})
 
+		It("should recover from a truncated DNSKEY reply on the next walk", func() {
+			chain := newSignedChain()
+			truncate := true
+			mockUpstream.ResolveFn = func(ctx context.Context, req *model.Request) (*model.Response, error) {
+				if q := req.Req.Question[0]; q.Qtype == dns.TypeDNSKEY && q.Name == chain.parent && truncate {
+					truncate = false
+
+					return &model.Response{Res: &dns.Msg{MsgHdr: dns.MsgHdr{Truncated: true}}}, nil
+				}
+
+				return chain.resolve(ctx, req)
+			}
+			v := NewValidator(ctx, chain.anchors, sut.logger, mockUpstream, 1, 10, 150, 30, 3600)
+
+			result, _ := v.walkChainOfTrust(ctx, chain.child)
+			Expect(result).Should(Equal(ValidationResultIndeterminate))
+
+			result, _ = v.walkChainOfTrust(ctx, chain.child)
+			Expect(result).Should(Equal(ValidationResultSecure))
+		})
+
 		It("should take the cache lifetime from the signature that verified the keys", func() {
 			chain := newSignedChain()
 			stale := *chain.childKeySig

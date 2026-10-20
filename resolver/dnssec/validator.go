@@ -255,6 +255,14 @@ func (v *Validator) ValidateResponse(
 		result = ValidationResultInsecure
 	}
 
+	// A validation that ran out of query budget is incomplete. Unlike an unreachable upstream, the
+	// response itself can force this, so its answer is refused instead of passed on unvalidated.
+	if result == ValidationResultIndeterminate && queryBudgetExhausted(ctx) {
+		v.logger.Warnf("Query budget exhausted while validating %s - treating as Bogus", question.Name)
+
+		result = ValidationResultBogus
+	}
+
 	v.recordMetrics(start, result)
 
 	return result
