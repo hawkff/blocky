@@ -95,7 +95,20 @@ func (v *Validator) setCachedValidation(
 // validated DNSKEY RRset. The walk starts at the closest trust anchor at or above domain and
 // validates each zone below it with the validated keys of the zone above. Every zone is cached
 // with its keys, so zones share their ancestors' work and a warm chain needs no upstream query.
+// A domain that is part of its parent zone has no keys of its own and is Bogus.
 func (v *Validator) walkChainOfTrust(ctx context.Context, domain string) (ValidationResult, []*dns.DNSKEY) {
+	return v.walk(ctx, domain, true)
+}
+
+// walkToEnclosingZone is walkChainOfTrust for a name that may be part of its parent zone, like
+// co.jp inside jp. It returns the status and keys of the zone that holds the name's records.
+func (v *Validator) walkToEnclosingZone(ctx context.Context, name string) (ValidationResult, []*dns.DNSKEY) {
+	return v.walk(ctx, name, false)
+}
+
+// walk implements walkChainOfTrust and walkToEnclosingZone. mustBeZone makes a domain that is part
+// of its parent zone Bogus instead of returning the parent zone's status and keys.
+func (v *Validator) walk(ctx context.Context, domain string, mustBeZone bool) (ValidationResult, []*dns.DNSKEY) {
 	// Normalize the domain name
 	domain = dns.Fqdn(domain)
 
@@ -138,13 +151,16 @@ func (v *Validator) walkChainOfTrust(ctx context.Context, domain string) (Valida
 		return ValidationResultIndeterminate, nil
 	}
 
-	return v.walkDown(ctx, zones[start:])
+	return v.walkDown(ctx, zones[start:], mustBeZone)
 }
 
-// walkDown validates names, a trust-anchored zone followed by the names below it down to the zone
+// walkDown validates names, a trust-anchored zone followed by the names below it down to the name
 // being walked, each with the validated keys of the zone above it. A name that the zone above
 // proves to be part of that zone, like co.jp inside jp, keeps that zone's keys (RFC 4035 §5.2).
-func (v *Validator) walkDown(ctx context.Context, names []string) (ValidationResult, []*dns.DNSKEY) {
+// mustBeZone makes the walk Bogus when the last name is such a name.
+func (v *Validator) walkDown(
+	ctx context.Context, names []string, mustBeZone bool,
+) (ValidationResult, []*dns.DNSKEY) {
 	var (
 		result ValidationResult
 		keys   []*dns.DNSKEY
@@ -167,7 +183,7 @@ func (v *Validator) walkDown(ctx context.Context, names []string) (ValidationRes
 
 		if !zoneCut {
 			// Not cached: an entry would answer a later walk for name as if it were a zone.
-			if i == len(names)-1 {
+			if i == len(names)-1 && mustBeZone {
 				v.logger.Warnf("%s is not a zone, so it has no keys to sign with", name)
 
 				return ValidationResultBogus, nil
@@ -657,11 +673,11 @@ func (v *Validator) getParentDomain(domain string) string {
 }
 
 // validateDSRecordSignature validates a DS record RRSIG with the validated DNSKEY RRset of the
-// parent zone
+// zone that holds parentDomain, the zone that delegates domain
 func (v *Validator) validateDSRecordSignature(
 	ctx context.Context, domain, parentDomain string, dsRRset []dns.RR, dsRRSIG *dns.RRSIG,
 ) ValidationResult {
-	parentResult, parentKeys := v.walkChainOfTrust(ctx, parentDomain)
+	parentResult, parentKeys := v.walkToEnclosingZone(ctx, parentDomain)
 	if parentResult != ValidationResultSecure {
 		v.logger.Warnf("Parent zone %s of %s is %s, cannot validate its DS RRset",
 			parentDomain, domain, parentResult.String())

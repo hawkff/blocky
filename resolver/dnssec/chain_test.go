@@ -956,6 +956,17 @@ var _ = Describe("Chain of trust validation", func() {
 				"the genuine co.jp. proof is still accepted")
 		})
 
+		It("checks the DS RRset of jprs.co.jp. with the keys of jp., the zone that holds co.jp.", func() {
+			v := NewValidator(ctx, c.anchors, sut.logger, mockUpstream, 1, 10, 150, 30, 3600)
+			ds := c.answers["DS jprs.co.jp."].Answer
+
+			Expect(v.validateDSRecordSignature(ctx, "jprs.co.jp.", "co.jp.", ds[:1], ds[1].(*dns.RRSIG))).
+				Should(Equal(ValidationResultSecure))
+
+			result, _ := v.walkChainOfTrust(ctx, "co.jp.")
+			Expect(result).Should(Equal(ValidationResultBogus), "co.jp. is still no signer")
+		})
+
 		It("rejects co.jp. as a signer without caching it, so zones below it still validate", func() {
 			v := NewValidator(ctx, c.anchors, sut.logger, mockUpstream, 1, 10, 150, 30, 3600)
 
